@@ -1,8 +1,8 @@
 # Sparse ANP / DANP for FPGA-Oriented Online Learning
 
-**Research question:** Can sparse node perturbation reach comparable accuracy to full
-node perturbation while significantly reducing training energy and compute cost for
-FPGA-based online learning systems?
+**Research question:** Can sparse, hardware-friendly node perturbation preserve
+near-dense ANP/DANP learning performance while reducing perturbation-related
+training cost components for FPGA-oriented online learning systems?
 ---
 
 ## Table of Contents
@@ -20,6 +20,9 @@ FPGA-based online learning systems?
    - [E7 Gaussian vs Rademacher](#e7)
    - [E8 Budget sweep + coverage floor (Fashion-MNIST)](#e8)
    - [E9 Antithetic / resample / single](#e9)
+   - [E10 EMA normalizer: amortizing the ANP global norm](#e10)
+   - [E11 Linearized ANP: replacing the nonlinear noisy forward](#e11)
+   - [E12 Lazy DANP decorrelation: amortizing R updates](#e12)
 5. [Key findings](#findings)
 6. [Limitations and next steps](#limitations)
 7. [Missing / unverified data](#missing)
@@ -44,8 +47,10 @@ Activity-based Node Perturbation (ANP) [Jabri & Flower, IEEE Trans. Neural Netw.
 directly as the update direction. ANP uses the *measured activation difference* δa_l
 instead. This matters because noise injected into layer l−1 also shifts activations in
 layer l; the activation difference captures that propagated effect while the injected
-noise alone does not. ANP therefore produces a better gradient estimate without storing
-the noise vectors — only the two sets of activations are needed.
+noise alone does not. ANP can provide a more informative update direction than raw NP in multilayer
+networks, because δa_l includes the propagated effect of upstream perturbations.
+The update does not rely directly on the raw injected noise vectors; it uses
+clean/noisy activations and layer inputs.
 
 **Cost vs backprop:** 2 forward passes (clean + noisy), no backward pass.
 
@@ -60,7 +65,14 @@ distributions were tested:
   variance as Gaussian, requires only one random bit per node in hardware.
 
 **Sparse perturbation:** a binary mask activates only fraction α of nodes per layer.
-Inactive nodes receive zero noise and no weight update. Cost ∝ α.
+Inactive nodes receive zero perturbation and do not contribute to the sparse
+perturbation update for that layer. The active-node cost proxy therefore scales
+approximately with α.
+
+This does not mean that total training FLOPs scale with α: the clean and noisy
+forward matrix multiplications remain dense in the current implementation. Therefore,
+α should be interpreted as a perturbation/update-side proxy, not a full hardware
+runtime or energy measurement.
 
 Two mask policies:
 - **random** — fresh random subset each step.
@@ -96,6 +108,7 @@ Two mask policies:
     ├── fashion_rademacher_budget_extreme/  # same, α=0.015625 and 0.03125
     ├── fashion_rademacher_random_policy/   # ANP [64,64] Rademacher random, Fashion
     ├── fashion_antithetic_anp/      # ANP [64,64] single/antithetic/resample, Fashion
+    ├── fashion_norm_ablation/       # ANP [64,64] exact/ema norm, Fashion (E10)
     ├── cifar10_dense_pilot/         # ANP [64,64] Gaussian+Rademacher dense, CIFAR-10
     ├── mnist_danp_full_20/          # DANP [1024,1024,1024] full, MNIST  †
     ├── mnist_danp_random_25_20/     # DANP [1024,1024,1024] random 25%, MNIST  †
@@ -109,6 +122,9 @@ Two mask policies:
     ├── mnist_danp_sched25_h64/      # DANP [64,64,64] scheduled 25%, MNIST  †
     ├── mnist_danp_full_h256/        # DANP [256,256,256] full, MNIST  †
     ├── mnist_danp_sched25_h256/     # DANP [256,256,256] scheduled 25%, MNIST  †
+    ├── fashion_linearized_pilot/    # ANP [64,64] noisy vs linearized, Fashion-MNIST (E11)
+    ├── fashion_linearized_compare/  # ANP [64,64] compare-mode diagnostics, Fashion-MNIST (E11)
+    ├── cifar10_lazy_danp_pilot/     # DANP [256,256,256] lazy decorrelation, CIFAR-10 (E12)
     └── ...
 ```
 
@@ -177,6 +193,11 @@ python main.py \
 | `--layer_allocation` | Budget split across layers | `uniform`, `front_loaded`, `back_loaded`, `middle_loaded` |
 | `--noise_distribution` | Noise type | `gaussian`, `rademacher` |
 | `--noise_sampling` | One or two noisy passes | `single`, `antithetic`, `resample` |
+| `--norm_mode` | ANP normalizer mode | `exact` (default), `ema`, `none` |
+| `--norm_beta` | EMA decay for `--norm_mode ema` | 0.99 |
+| `--norm_update_every` | Recompute ‖δa‖² every K steps | 1, 20, 100 |
+| `--delta_mode` | How to compute activity differences | `noisy` (default), `linearized`, `compare` |
+| `--decor_update_every` | DANP decorrelation R update frequency | 1, 5, 20, 100 |
 | `--probe_layer` | Ablation: perturb only one layer | integer index or `all` |
 | `--num_seeds` | Number of seeds run from `--seed` | 3 |
 
@@ -219,7 +240,7 @@ python main.py --dataset mnist --algorithm danp \
 
 \* Run for only 5 epochs — not comparable to the 20-epoch rows; see [E2](#e2).
 
-At 25% active nodes (75% cost reduction) DANP drops < 0.008 accuracy on MNIST.
+At 25% active nodes (75% reduction in the active-node perturbation/update proxy) DANP drops < 0.008 accuracy on MNIST.
 
 **CIFAR-10 results** (DANP, 5 epochs, peak, no per-seed CSV; n=3):
 
@@ -600,11 +621,332 @@ python main.py --dataset fashion_mnist --algorithm anp \
 
 ---
 
+### E10 — EMA Normalizer: Amortizing the ANP Global Norm <a name="e10"></a>
+
+**Motivation:** The ANP weight update divides the activity-difference error by the
+network-wide activity norm ‖δa‖²:
+
+    ΔW_l ∝ δL · δa_l / ‖δa‖² · x_{l-1}^T
+
+Computing ‖δa‖² exactly requires a global reduction over all active-layer outputs every
+training step. On FPGA, this means reading all activations into a reduction tree and
+then performing a per-sample division — an operation that cannot be easily pipelined
+when the global norm is needed before the weight update can proceed.
+
+The hypothesis is that ‖δa‖² changes slowly relative to weight updates, so an
+exponential moving average (EMA) can replace the exact per-step value without
+measurable accuracy loss. Refreshing the EMA every K steps amortises the global
+reduction cost by K and, in hardware, allows the per-step division to be replaced by
+multiplication with a stored scalar reciprocal.
+
+**This experiment does not reduce active-node count.** It is orthogonal to the sparse
+perturbation experiments above. The active-node cost (α) is fixed; the change is solely
+in how the normalizer ‖δa‖² is computed.
+
+**New CLI flags:**
+
+```
+--norm_mode {exact, ema, none}   default: exact
+--norm_beta FLOAT                EMA decay; default: 0.99
+--norm_update_every INT          recompute norm every K steps; default: 1
+--norm_eps FLOAT                 denominator epsilon; default: 1e-8
+```
+
+**Method:** ANP [64,64], Fashion-MNIST, Rademacher, scheduled, 20 epochs,
+α ∈ {0.0625, 0.125, 0.25}, 3 seeds per condition.
+
+```bash
+# exact (baseline, K=1)
+python main.py --dataset fashion_mnist --algorithm anp \
+  --hidden_sizes 64 64 --epochs 20 \
+  --sparse --sparse_fraction 0.0625 --sparse_policy scheduled \
+  --noise_distribution rademacher \
+  --norm_mode exact \
+  --num_seeds 3 --seed 42 \
+  --write_results_dir results/fashion_norm_ablation \
+  --exp_name fashion_norm_exact_0.0625
+
+# EMA, K=20
+python main.py --dataset fashion_mnist --algorithm anp \
+  --hidden_sizes 64 64 --epochs 20 \
+  --sparse --sparse_fraction 0.125 --sparse_policy scheduled \
+  --noise_distribution rademacher \
+  --norm_mode ema --norm_beta 0.99 --norm_update_every 20 \
+  --num_seeds 3 --seed 42 \
+  --write_results_dir results/fashion_norm_ablation \
+  --exp_name fashion_norm_ema_k20_0.125
+
+# EMA, K=100
+python main.py --dataset fashion_mnist --algorithm anp \
+  --hidden_sizes 64 64 --epochs 20 \
+  --sparse --sparse_fraction 0.25 --sparse_policy scheduled \
+  --noise_distribution rademacher \
+  --norm_mode ema --norm_beta 0.99 --norm_update_every 100 \
+  --num_seeds 3 --seed 42 \
+  --write_results_dir results/fashion_norm_ablation \
+  --exp_name fashion_norm_ema_k100_0.25
+```
+
+**Results (n=3, mean ± std best test accuracy, Fashion-MNIST):**
+
+| α | norm mode | K | mean best acc | std | mean final acc | min final acc | active-node cost |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 0.0625 | exact | 1 | 0.8161 | 0.0012 | 0.7848 | 0.7536 | 0.065 |
+| 0.0625 | ema | 1 | 0.8084 | 0.0010 | 0.8057 | 0.8013 | 0.065 |
+| 0.0625 | ema | 20 | 0.8038 | 0.0062 | 0.7074 | 0.6108 | 0.065 |
+| 0.0625 | ema | 100 | 0.8085 | 0.0050 | 0.8080 | 0.8027 | 0.065 |
+| 0.125 | exact | 1 | 0.8126 | 0.0047 | 0.8061 | 0.7991 | 0.123 |
+| 0.125 | ema | 1 | 0.8166 | 0.0055 | 0.8064 | 0.8001 | 0.123 |
+| 0.125 | ema | 20 | 0.8148 | 0.0057 | 0.8086 | 0.7996 | 0.123 |
+| 0.125 | ema | 100 | 0.8222 | 0.0019 | 0.8059 | 0.7968 | 0.123 |
+| 0.25 | exact | 1 | 0.8163 | 0.0041 | 0.8077 | 0.7980 | 0.246 |
+| 0.25 | ema | 1 | 0.8203 | 0.0026 | 0.8086 | 0.7920 | 0.246 |
+| 0.25 | ema | 20 | 0.8201 | 0.0042 | 0.8164 | 0.8113 | 0.246 |
+| 0.25 | ema | 100 | 0.8194 | 0.0043 | 0.8184 | 0.8155 | 0.246 |
+
+Because `active-node cost` reports only the sparse perturbation/update proxy, the
+normalizer saving is not reflected in that column. EMA normalization targets a separate
+cost component: the global ‖δa‖² reduction and division.
+
+**Interpretation:** EMA normalization preserves ANP learning performance while reducing
+the frequency of the exact global normalization computation. Across Fashion-MNIST sparse
+budgets, EMA-normalized ANP matches exact normalization in best accuracy within
+seed-level variation. At α=0.125 and α=0.25, EMA with K=100 performs comparably to
+exact normalization while updating the global norm estimate only once every 100 steps.
+At α=0.0625, exact normalization gives the highest mean best accuracy, but EMA K=100
+gives better final-training stability. EMA K=20 is unstable at α=0.0625 (mean final acc
+0.7074, min 0.6108), so the effect is not monotonic and should not be overclaimed.
+
+**Hardware note:** Exact normalization requires a per-step global reduction over all
+‖δa‖² values and a division at every weight-update step. EMA normalization replaces
+this with a stored scalar estimate. In hardware, the reciprocal of the EMA value can be
+precomputed or updated only when the EMA is refreshed, so the per-step division can be
+replaced by multiplication with a stored reciprocal. This is an FPGA-oriented
+approximation to reduce normalization overhead. It does not reduce the cost of the main
+forward passes or weight-update matrix multiplications, which remain unchanged.
+
+**Limitation:** We did not sweep β. All EMA runs used β=0.99, so the EMA result is a refresh-frequency ablation rather than a beta-sensitivity study. Since β=0.99 is a slow-moving average, especially when combined with large K, future work should test β ∈ {0.9, 0.95, 0.99}.
+---
+
+### E11 — Linearized ANP: Replacing the Nonlinear Noisy Forward <a name="e11"></a>
+
+**Motivation:** Standard ANP computes a clean forward pass and then a full nonlinear
+noisy forward pass to measure activity differences. In the small-noise regime, the
+noisy activity difference can be approximated by first-order perturbation propagation:
+
+    δa_l ≈ f'(z_l) ⊙ (W_l δa_{l-1} + ε_l)
+
+where z_l comes from the clean pass, f'(z_l) is the clean activation derivative mask,
+and δa_0 = 0. This replaces the full nonlinear noisy activation recomputation with
+tangent/delta propagation.
+
+**Important scope:** Linearized ANP does not remove the clean forward pass. It also does
+not necessarily remove all noisy-pass matrix multiplication: dense delta propagation can
+still require dense matmuls. The expected hardware benefit comes from avoiding nonlinear
+noisy activation recomputation, reducing the need to store full noisy activations, and
+enabling sparse delta propagation in future implementations.
+
+**New CLI flags:**
+
+```
+--delta_mode {noisy, linearized, compare}   default: noisy
+```
+
+- `noisy`: original ANP behavior — full clean forward + full nonlinear noisy forward.
+- `linearized`: replaces the noisy forward with first-order delta propagation. No
+  `forward_noisy()` call is made; δz_l is computed from the clean-pass derivative masks
+  and propagated through the network.
+- `compare`: diagnostic mode — runs both paths on the same batch/noise/mask, trains on
+  the noisy path, and logs approximation-quality metrics per batch
+  (`rel_delta_z_error`, `rel_delta_logits_error`, `rel_delta_L_error`).
+
+**Method:** ANP [64,64], Fashion-MNIST, Rademacher noise, scheduled sparse masks, exact
+normalizer, 20 epochs, batch_size=500, lr=0.001, σ=0.01, n=3 seeds.
+
+```bash
+# noisy (baseline)
+python main.py --dataset fashion_mnist --algorithm anp \
+  --hidden_sizes 64 64 --epochs 20 \
+  --sparse --sparse_fraction 0.125 --sparse_policy scheduled \
+  --noise_distribution rademacher --noise_sampling single \
+  --delta_mode noisy \
+  --num_seeds 3 --seed 42 \
+  --write_results_dir results/fashion_linearized_pilot \
+  --exp_name fashion_linearized_noisy_0.125
+
+# linearized
+python main.py --dataset fashion_mnist --algorithm anp \
+  --hidden_sizes 64 64 --epochs 20 \
+  --sparse --sparse_fraction 0.125 --sparse_policy scheduled \
+  --noise_distribution rademacher --noise_sampling single \
+  --delta_mode linearized \
+  --num_seeds 3 --seed 42 \
+  --write_results_dir results/fashion_linearized_pilot \
+  --exp_name fashion_linearized_lin_0.125
+
+# compare (diagnostic)
+python main.py --dataset fashion_mnist --algorithm anp \
+  --hidden_sizes 64 64 --epochs 5 \
+  --sparse --sparse_fraction 0.125 --sparse_policy scheduled \
+  --noise_distribution rademacher --noise_sampling single \
+  --delta_mode compare \
+  --num_seeds 1 --seed 42 \
+  --write_results_dir results/fashion_linearized_pilot \
+  --exp_name fashion_linearized_compare_0.125
+```
+
+Compare mode is diagnostic-only. It is not used for the main accuracy table; it is used
+to measure how closely the linearized delta path approximates the full noisy forward on
+the same batch/noise/mask.
+
+**Results (n=3, Fashion-MNIST):**
+
+| α | delta mode | mean best acc | std best | mean final acc | min final acc | active-node cost | nonlinear noisy activation evals saved / batch |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 0.0625 | noisy | 0.8094 | 0.0015 | 0.7952 | 0.7764 | 0.065 | 0 |
+| 0.0625 | linearized | 0.8112 | 0.0045 | 0.7966 | 0.7859 | 0.065 | 64000 |
+| 0.125 | noisy | 0.8174 | 0.0095 | 0.7886 | 0.7740 | 0.123 | 0 |
+| 0.125 | linearized | 0.8147 | 0.0042 | 0.7842 | 0.7455 | 0.123 | 64000 |
+| 0.25 | noisy | 0.8210 | 0.0029 | 0.8176 | 0.8109 | 0.246 | 0 |
+| 0.25 | linearized | 0.8192 | 0.0013 | 0.8127 | 0.8031 | 0.246 | 64000 |
+
+**Interpretation:** Linearized ANP matches the original noisy-forward ANP within
+seed-level variation across all tested sparse budgets. The mean-best accuracy difference
+is small: +0.0018 at α=0.0625, −0.0027 at α=0.125, and −0.0018 at α=0.25. This supports
+the small-noise hypothesis that, at σ=0.01, the nonlinear noisy forward can be
+approximated by first-order delta propagation without a meaningful accuracy loss.
+
+However, final-epoch stability is not uniformly better. At α=0.125, linearized ANP has
+a lower minimum final accuracy (0.7455 vs 0.7740), so robustness should not be
+overclaimed.
+
+**Hardware note:** The saved count `64000` is a proxy for hidden-layer nonlinear
+activation evaluations avoided per batch: batch_size × (64 + 64) = 500 × 128. It is not
+a full FLOP or energy measurement. The current implementation still performs dense delta
+propagation. Therefore, this experiment should be interpreted as evidence that nonlinear
+noisy activation recomputation and full noisy activation storage may be avoidable, not
+as a measured total runtime reduction.
+
+#### Compare-mode diagnostic
+
+To directly verify the small-noise approximation, we ran `--delta_mode compare` across
+the same Fashion-MNIST sparse budgets. Compare mode runs both the full nonlinear noisy
+forward path and the first-order linearized delta path on the same batch, same noise
+draw, and same sparse mask, then logs the approximation error between them. Training
+still uses the noisy path; compare mode is diagnostic-only and is not used for the
+accuracy results above.
+
+**Method:** Fashion-MNIST, ANP [64,64], Rademacher noise, scheduled sparse masks, exact
+normalizer, σ=0.01, batch_size=500, lr=0.001, 5 epochs, n=3 seeds,
+α ∈ {0.0625, 0.125, 0.25}.
+
+```bash
+python main.py --dataset fashion_mnist --algorithm anp \
+  --hidden_sizes 64 64 --epochs 5 \
+  --batch_size 500 --lr 0.001 --noise_std 0.01 \
+  --sparse --sparse_fraction 0.125 --sparse_policy scheduled \
+  --layer_allocation uniform \
+  --noise_distribution rademacher --noise_sampling single \
+  --norm_mode exact \
+  --delta_mode compare \
+  --seed 42 \
+  --write_results_dir results/fashion_linearized_compare \
+  --exp_name fashion_compare_0.125_seed42
+```
+
+**Results (n=3 seeds, last-epoch mean per condition):**
+
+| α | active-node cost | mean rel_δz | mean rel_δlogits | mean abs_δL | mean rel_δL |
+|---:|---:|---:|---:|---:|---:|
+| 0.0625 | 0.065 | 0.00161 | 0.00425 | 1.9e-06 | 0.062 |
+| 0.125 | 0.123 | 0.00235 | 0.00661 | 3.4e-06 | 0.096 |
+| 0.25 | 0.246 | 0.00296 | 0.00836 | 4.6e-06 | 0.113 |
+
+Metric definitions:
+- `rel_δz`: relative error between noisy and linearized activity differences,
+  ‖δz_noisy − δz_lin‖ / ‖δz_noisy‖, averaged over the batch and epoch.
+- `rel_δlogits`: same, for the output logit differences.
+- `abs_δL`: absolute difference |δL_noisy − δL_lin|, averaged over the batch.
+- `rel_δL`: |δL_noisy − δL_lin| / |δL_noisy|.
+
+**Interpretation:** The activity and logit errors are small: `rel_δz` stays below 0.30%
+and `rel_δlogits` below 0.84% across all tested budgets. Both increase mildly with α,
+which is expected since more active nodes means a larger aggregate first-order
+approximation error. The `rel_δL` values (6–11%) look moderate but must be read
+alongside `abs_δL`: the absolute δL gap is in the range 1.9–4.6 × 10⁻⁶, because δL
+itself is very small at σ=0.01. Relative δL error inflates when the denominator is tiny;
+the absolute error is the more informative quantity here.
+
+Together with the noisy vs. linearized accuracy comparison above, these diagnostics
+support the small-noise explanation: at σ=0.01, the full nonlinear noisy forward and
+the first-order linearized delta path remain close on the same inputs, and this
+closeness is consistent with the observed accuracy match. This does not validate the
+approximation at larger σ, on other datasets, or with wider networks.
+
+---
+
+### E12 — Lazy DANP Decorrelation: Amortizing R Updates <a name="e12"></a>
+
+**Motivation:** DANP adds decorrelation matrices R on top of ANP. There are two
+separate operations:
+
+1. Applying the current R matrices every step.
+2. Updating R using the decorrelation update.
+
+This experiment only makes the R *update* lazy. R is still applied every training
+step. The weight update frequency is unchanged.
+
+**New CLI flag:**
+
+```
+--decor_update_every K   default: 1
+```
+
+K=1 is the original DANP behavior — R is updated every step. K>1 updates R only
+every K global training steps; R is still applied (unchanged) on every step in
+between.
+
+**Method:** CIFAR-10, DANP [256,256,256], scheduled sparse α=0.25, Rademacher
+noise, 5 epochs, batch_size=500, lr=0.001, decor_lr=0.001, σ=0.01, n=3 seeds.
+
+```bash
+# K=5
+python main.py --dataset cifar10 --algorithm danp \
+  --hidden_sizes 256 256 256 --epochs 5 \
+  --batch_size 500 --lr 0.001 --decor_lr 0.001 \
+  --sparse --sparse_fraction 0.25 --sparse_policy scheduled \
+  --noise_distribution rademacher \
+  --decor_update_every 5 \
+  --num_seeds 3 --seed 42 \
+  --write_results_dir results/cifar10_lazy_danp_pilot \
+  --exp_name cifar10_danp_lazy_k5
+```
+
+**Results (n=3, CIFAR-10):**
+
+| K | mean best acc | std best | mean final acc | min final acc | decor update fraction | mean updates | total steps |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.3902 | 0.0060 | 0.3902 | 0.3843 | 1.000 | 500.0 | 500.0 |
+| 5 | 0.3868 | 0.0110 | 0.3868 | 0.3752 | 0.200 | 100.0 | 500.0 |
+| 20 | 0.3609 | 0.0023 | 0.3609 | 0.3585 | 0.050 | 25.0 | 500.0 |
+| 100 | 0.3186 | 0.0086 | 0.3186 | 0.3087 | 0.010 | 5.0 | 500.0 |
+
+**Interpretation:** K=5 matches K=1 within seed-level variation while reducing the
+decorrelation-update frequency from 100% to 20%. K=20 and K=100 clearly degrade
+CIFAR-10 accuracy, so decorrelation can be amortized but not made too infrequent.
+
+**Hardware/cost note:** `decor_update_fraction` is a proxy for DANP-specific
+decorrelation-update frequency. It is not a measured FPGA energy or runtime
+reduction. Applying R and the main ANP/DANP weight updates still occur every step.
+
+---
+
 ## 5. Key findings <a name="findings"></a>
 
-1. **Sparse perturbation preserves accuracy.** At α=25% (75% cost reduction), DANP
-   drops < 0.008 on MNIST across all tested widths. On Fashion-MNIST (harder), 12.5%
-   active nodes (87% cost reduction) costs about 0.004–0.006 relative to α=50%.
+1. **Sparse perturbation preserves accuracy.** At α=25% (75% reduction in the
+   active-node perturbation/update proxy), DANP drops < 0.008 on MNIST across all
+   tested widths. On Fashion-MNIST (harder), 12.5% active nodes (87% reduction in the
+   active-node perturbation/update proxy) costs about 0.004–0.006 relative to α=50%.
 
 2. **Adaptive top-k selection adds nothing.** ActivityLoss, ActivityDiff, and
    GradientAligned policies match or underperform random and scheduled at matched
@@ -612,9 +954,11 @@ python main.py --dataset fashion_mnist --algorithm anp \
    0.13–0.16), so no node is consistently more valuable than others.
 
 3. **Coverage is the real lever.** Both random and scheduled ensure every node
-   participates periodically. Scheduled (a counter, not a LFSR + comparator) is
-   strictly cheaper in hardware and achieves the same or slightly better accuracy.
-   Uniform layer allocation is the safest default among the tested allocations.
+   participates periodically. Scheduled mask generation is more hardware-friendly than
+   random or top-k policies because it can be implemented with a counter and avoids
+   sorting/ranking. In the tested experiments, scheduled is broadly comparable to
+   random in accuracy. Uniform layer allocation is the safest default among the tested
+   allocations.
 
 4. **Rademacher noise has no measurable accuracy cost.** Replacing Gaussian with
    Rademacher (one random bit per node) causes no measurable accuracy drop at any
@@ -623,6 +967,22 @@ python main.py --dataset fashion_mnist --algorithm anp \
 5. **Two-pass variance reduction is not worth the doubled cost.** Antithetic shows no
    gain. Resample shows a small positive trend but it is inconclusive at n=3 and
    doubles noisy-pass count. Use `--noise_sampling single`.
+
+6. **Exact per-step ANP normalization is not always necessary.** On Fashion-MNIST, EMA
+   normalization with K=100 preserved near-exact best accuracy at α=0.125 and α=0.25,
+   suggesting that the global ‖δa‖² reduction can be amortized for FPGA-oriented online
+   learning. The effect is not universal: at α=0.0625, EMA K=20 was unstable. Further
+   validation across seeds and datasets is needed before claiming robustness.
+
+7. **Linearized ANP preserves learning in the small-noise regime.** On Fashion-MNIST,
+   replacing the full nonlinear noisy forward with first-order delta propagation matched
+   noisy ANP within seed-level variation across α ∈ {0.0625, 0.125, 0.25}. This suggests
+   that ANP's noisy pass can be approximated using clean-pass derivative masks at σ=0.01,
+   although dense delta matmuls still remain and FPGA runtime savings are not yet measured.
+
+8. **Lazy DANP decorrelation can reduce R-update frequency.** On CIFAR-10, K=5
+   preserved performance within seed-level variation while reducing R updates to
+   20%, but K≥20 degraded accuracy.
 
 ---
 
@@ -642,17 +1002,36 @@ python main.py --dataset fashion_mnist --algorithm anp \
   measured.
 - **Gradient distribution stats from earlier logs.** The CV/Gini/Top-10% values (E3)
   are from a pre-CSV logging format; no per-seed breakdown is available.
+- **EMA normalizer results are limited.** Based on n=3 seeds and Fashion-MNIST only.
+  The K effect is non-monotonic: K=20 was unstable at α=0.0625, so further seeds and
+  datasets are needed before claiming robustness across configurations.
+- **Linearized ANP is a pilot.** Results are based on Fashion-MNIST, n=3 seeds, ANP
+  [64,64], and σ=0.01 only. Compare-mode diagnostics confirm the first-order
+  approximation is close at this scale (rel_δz < 0.30%, rel_δlogits < 0.84%), but
+  validation on CIFAR-10, DANP, or wider networks has not been done. The current
+  implementation does not yet implement sparse delta-matmul skipping or measure FPGA
+  runtime/resource savings.
+- **Lazy DANP decorrelation is a pilot.** Tested only on CIFAR-10, DANP
+  [256,256,256], 5 epochs, n=3 seeds. FPGA runtime/resource savings are not yet
+  measured.
 
 **Next steps:**
 
-1. **FPGA cost model on Kria.** Translate α → energy and resource savings; measure
-   throughput at different sparsity levels.
-2. **Reduce computation inside the algorithm.** Candidates: skip ‖δa‖² normalisation
-   periodically (constant normaliser); reduce decorrelation update frequency; quantise
-   the weight update.
+1. **FPGA cost model on Kria.** Translate active-node cost, RNG cost, noisy-pass count,
+   and normalization overhead into FPGA-relevant proxy metrics. Then measure throughput
+   and resource usage on KR260 where feasible.
+2. **Reduce computation inside the algorithm.** EMA normalization (E10) is a first step
+   toward amortizing the ‖δa‖² reduction. Further candidates: validate lazy
+   decorrelation on larger DANP models, explore block-diagonal / low-rank
+   decorrelation, and quantise the weight update.
 3. **Confirm resample trend** with more seeds (n ≥ 5) before committing to it.
 4. **Harder benchmarks** (CIFAR-100, or an edge-vision task) once the FPGA pipeline is
    in place.
+5. **Extend linearized ANP to harder datasets and wider networks.** Compare-mode
+   diagnostics on Fashion-MNIST confirm the small-noise approximation holds at σ=0.01
+   for ANP [64,64]. Validation on CIFAR-10 / DANP and larger networks remains open.
+6. **Explore sparse delta propagation / skipped delta matmuls** so that linearized ANP
+   can turn sparse perturbation into actual matmul reduction.
 
 ---
 
@@ -666,3 +1045,4 @@ python main.py --dataset fashion_mnist --algorithm anp \
 | MNIST scheduled 50% at 20 epochs, DANP h=1024 | Experiment not run |
 | ANP [64,64] CIFAR-10 with sparse perturbation | Not run; only dense pilot exists |
 | `noise_std` and `noise_distribution` for layer_allocation and probe_layer | Not in CSV (pre-feature addition); inferred as `gaussian` / `0.01` from code defaults |
+| Fashion-MNIST linearized compare-mode diagnostics | Completed: α ∈ {0.0625, 0.125, 0.25}, n=3 seeds; results in E11 compare-mode section |

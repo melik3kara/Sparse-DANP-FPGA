@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.datasets import mnist, cifar10, cifar100
+from tensorflow.keras.datasets import mnist, fashion_mnist, cifar10, cifar100
 
 
 def set_seed(seed: int) -> None:
@@ -37,8 +37,9 @@ def load_dataset(
 ) -> Tuple[tf.data.Dataset, tf.data.Dataset, dict]:
     name = name.lower()
 
-    if name == "mnist":
-        (x_train, y_train), (x_test, y_test) = mnist.load_data()
+    if name in ("mnist", "fashion_mnist"):
+        loader = mnist if name == "mnist" else fashion_mnist
+        (x_train, y_train), (x_test, y_test) = loader.load_data()
         num_classes = 10
         x_train, x_test = _normalize_unit_range(x_train, x_test)
 

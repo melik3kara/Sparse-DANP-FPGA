@@ -36,7 +36,71 @@ gradient_aligned_topk
 """
 from __future__ import annotations
 
+from typing import Union
 import tensorflow as tf
+
+
+# ---------------------------------------------------------------------------
+# Layer allocation
+# ---------------------------------------------------------------------------
+
+def allocate_fractions(
+    layer_sizes: list[int],
+    total_fraction: float,
+    mode: str,
+) -> list[float]:
+    """Return per-layer active fractions that maintain the total perturbation budget.
+
+    The total active nodes across all layers is approximately
+    ``total_fraction * sum(layer_sizes)``, distributed according to ``mode``.
+
+    Modes
+    -----
+    uniform       Same fraction for all layers — existing behaviour.
+    front_loaded  Earlier layers receive proportionally more of the budget.
+    back_loaded   Later layers receive proportionally more of the budget.
+    middle_loaded Middle layers receive more of the budget; falls back to
+                  uniform when the network has fewer than 3 layers.
+
+    Note: fractions are clipped to [1/H_l, 1.0] per layer, so the total
+    active-node count may be slightly less than ``total_fraction * Σ H_l``
+    when a small layer (e.g. a 10-node output layer) hits its ceiling.
+    """
+    L = len(layer_sizes)
+    if L == 0:
+        return []
+    if mode == "uniform" or L == 1:
+        return [total_fraction] * L
+
+    n_total = sum(layer_sizes)
+    k_total = max(L, round(total_fraction * n_total))
+
+    if mode == "front_loaded":
+        weights = [float(L - i) for i in range(L)]
+    elif mode == "back_loaded":
+        weights = [float(i + 1) for i in range(L)]
+    elif mode == "middle_loaded":
+        if L < 3:
+            return [total_fraction] * L
+        weights = [float(1 + min(i, L - 1 - i)) for i in range(L)]
+    else:
+        raise ValueError(
+            f"Unknown layer_allocation mode '{mode}'. "
+            "Choose from: uniform, front_loaded, back_loaded, middle_loaded."
+        )
+
+    w_sum = sum(weights)
+    fracs: list[float] = []
+    allocated = 0
+    for i, (w, h) in enumerate(zip(weights, layer_sizes)):
+        if i == L - 1:
+            # Last layer absorbs any rounding remainder.
+            k_l = max(1, min(h, k_total - allocated))
+        else:
+            k_l = max(1, min(h, round(k_total * w / w_sum)))
+        allocated += k_l
+        fracs.append(k_l / h)
+    return fracs
 
 
 def num_active_units(units: int, fraction: float) -> int:
@@ -85,30 +149,87 @@ def activation_threshold_mask(activations: tf.Tensor, fraction: float) -> tf.Ten
     return tf.reshape(mask, [1, units])
 
 
-def compute_sparse_masks(model, fraction: float, policy: str, step: int = 0) -> list[tf.Tensor]:
+def compute_sparse_masks(
+    model,
+    fraction: Union[float, list],
+    policy: str,
+    step: int = 0,
+) -> list[tf.Tensor]:
     """Compute one mask of shape [1, units] per layer in `model.layers_list`.
 
-    Requires a clean forward pass to have been run already (layer.outputs_clean
-    must be populated) for the "activation_threshold" policy.
+    Parameters
+    ----------
+    fraction : float or list[float]
+        A single fraction applied uniformly to all layers, **or** a list of
+        per-layer fractions (one per entry in ``model.layers_list``).
+        Per-layer fractions are produced by :func:`allocate_fractions`.
+    policy : str
+        One of ``"random"``, ``"scheduled"``, ``"activation_threshold"``.
+    step : int
+        Global training step, used by the ``"scheduled"`` policy.
+
+    Requires a clean forward pass to have been run already (``layer.outputs_clean``
+    must be populated) for the ``"activation_threshold"`` policy.
     """
     masks = []
-    for layer in model.layers_list:
+    for i, layer in enumerate(model.layers_list):
+        f = fraction[i] if isinstance(fraction, list) else fraction
         units = layer.units
 
         if policy == "random":
-            mask = random_mask(units, fraction)
+            mask = random_mask(units, f)
         elif policy == "scheduled":
-            mask = scheduled_mask(units, fraction, step=step)
+            mask = scheduled_mask(units, f, step=step)
         elif policy == "activation_threshold":
             if layer.outputs_clean is None:
                 raise RuntimeError(
                     "Need a clean forward pass before computing activation_threshold masks."
                 )
-            mask = activation_threshold_mask(layer.outputs_clean, fraction)
+            mask = activation_threshold_mask(layer.outputs_clean, f)
         else:
             raise ValueError(f"Unknown sparse policy: {policy}")
 
         masks.append(mask)
+    return masks
+
+
+def build_probe_masks(
+    model,
+    probe_layer: int,
+    probe_fraction: float,
+    policy: str,
+    step: int = 0,
+) -> list[tf.Tensor]:
+    """Build masks for single-layer probe mode.
+
+    The probe layer receives a policy-based mask with ``probe_fraction`` active
+    nodes.  Every other layer receives an all-zeros mask (zero noise, zero
+    gradient).
+
+    ``policy`` must be one of the one-pass policies: ``"random"``,
+    ``"scheduled"``, or ``"activation_threshold"``.  Two-pass adaptive policies
+    (``activity_diff_topk`` etc.) are not supported in probe mode because they
+    require a full-network provisional forward pass.
+    """
+    masks = []
+    for i, layer in enumerate(model.layers_list):
+        if i != probe_layer:
+            masks.append(tf.zeros([1, layer.units], dtype=tf.float32))
+        elif policy == "random":
+            masks.append(random_mask(layer.units, probe_fraction))
+        elif policy == "scheduled":
+            masks.append(scheduled_mask(layer.units, probe_fraction, step=step))
+        elif policy == "activation_threshold":
+            if layer.outputs_clean is None:
+                raise RuntimeError(
+                    "Need a clean forward pass before computing activation_threshold mask."
+                )
+            masks.append(activation_threshold_mask(layer.outputs_clean, probe_fraction))
+        else:
+            raise ValueError(
+                f"--probe_layer does not support two-pass policy '{policy}'. "
+                "Use random, scheduled, or activation_threshold."
+            )
     return masks
 
 

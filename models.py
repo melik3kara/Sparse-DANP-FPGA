@@ -53,17 +53,30 @@ class DecorrelatedDense(keras.layers.Dense):
             self.outputs_noisy = self.outputs_noisy + self.noise
         return self.activation_fn(self.outputs_noisy)
 
-    def reset_noise(self, noise_std: float, mask: tf.Tensor | None = None) -> None:
+    def reset_noise(
+        self,
+        noise_std: float,
+        mask: tf.Tensor | None = None,
+        noise_distribution: str = "gaussian",
+    ) -> None:
         if self.outputs_clean is None:
             raise RuntimeError("Call a clean forward pass before reset_noise().")
-        noise = tf.random.normal(
-            shape=tf.shape(self.outputs_clean),
-            mean=0.0,
-            stddev=noise_std,
-            dtype=self.outputs_clean.dtype,
-        )
+        shape = tf.shape(self.outputs_clean)
+        dtype = self.outputs_clean.dtype
+        if noise_distribution == "gaussian":
+            noise = tf.random.normal(shape=shape, mean=0.0, stddev=noise_std, dtype=dtype)
+        elif noise_distribution == "rademacher":
+            # Sample s_i ∈ {+1, −1} with equal probability; scale by noise_std so
+            # E[ε_i]=0 and E[ε_i²]=noise_std², matching Gaussian second moments.
+            signs = tf.cast(
+                tf.random.uniform(shape=shape, dtype=tf.float32) > 0.5, dtype=dtype
+            ) * tf.cast(2.0, dtype) - tf.cast(1.0, dtype)
+            noise = tf.cast(noise_std, dtype) * signs
+        else:
+            raise ValueError(f"Unknown noise_distribution: '{noise_distribution}'. "
+                             "Choose 'gaussian' or 'rademacher'.")
         if mask is not None:
-            # mask has shape [1, units] and broadcasts over the batch axis.
+            # mask shape [1, units] broadcasts over the batch axis.
             # Unselected nodes receive exactly zero noise (sparse perturbation).
             noise = noise * tf.cast(mask, noise.dtype)
         self.noise = noise
@@ -112,10 +125,15 @@ class MLP(keras.Model):
             x = layer.forward_noisy(x, decorrelate=decorrelate, add_noise=add_noise)
         return x
 
-    def reset_all_noise(self, noise_std: float, masks: list[tf.Tensor] | None = None) -> None:
+    def reset_all_noise(
+        self,
+        noise_std: float,
+        masks: list[tf.Tensor] | None = None,
+        noise_distribution: str = "gaussian",
+    ) -> None:
         for i, layer in enumerate(self.layers_list):
             mask = masks[i] if masks is not None else None
-            layer.reset_noise(noise_std, mask=mask)
+            layer.reset_noise(noise_std, mask=mask, noise_distribution=noise_distribution)
 
     def ordered_trainable_variables(self) -> list[tf.Variable]:
         vars_out = []
