@@ -16,7 +16,6 @@ from sparse import (
 from analysis import compute_gradient_dist_stats
 from coverage import compute_coverage_stats
 
-#lineralized ANP compariton diagnostics keys
 COMPARE_DIAG_KEYS = (
     "rel_delta_z_error",
     "rel_delta_logits_error",
@@ -24,6 +23,19 @@ COMPARE_DIAG_KEYS = (
     "delta_L_linearized",
     "abs_delta_L_error",
     "rel_delta_L_error",
+)
+
+# Analytical cost-accounting keys for delta_mode=linearized_sparse_aware.
+SAL_COST_KEYS = (
+    "sal_dense_macs",
+    "sal_sparse_aware_macs",
+    "sal_mac_saving_ratio",
+    "sal_selected_layer",
+    "sal_skipped_prefix_layers",
+    "sal_active_nodes_selected",
+    "sal_active_node_ratio_selected",
+    "sal_dense_matmuls",
+    "sal_sparse_matvecs",
 )
 
 
@@ -279,6 +291,168 @@ def linearized_activity_diffs(model):
     return delta_z_list, y_noisy_approx
 
 
+def linearized_activity_diffs_sparse_aware(model):
+    """
+    Sparse-aware variant of linearized_activity_diffs.
+
+    Produces the same delta_z_list as linearized_activity_diffs for the same
+    model state (same epsilon tensors), but skips multiply-accumulate operations
+    that are guaranteed to be zero by the sparse mask structure:
+
+    1. Prefix skipping: layers 0..s-1 whose noise is all-zero contribute
+       delta_a_l = 0.  Their propagation matmuls (0 @ W) are skipped entirely.
+    2. Zero-input injection: at the injection layer s, delta_z_s = epsilon_s
+       (no matmul, since delta_a_{s-1} = 0).
+    3. Sparse first-propagation: the first matmul after injection uses only
+       the k_s active-node columns of delta_a_s, saving (H_s - k_s) * H_{s+1}
+       MACs per batch sample.
+    4. Remaining layers: standard dense propagation (delta is no longer sparse).
+
+    Correctness: the dense path also computes delta_a_l = f'(z_l) * 0 = 0 for
+    prefix layers (since epsilon_l = 0), and delta_z_s = 0 @ W_s + epsilon_s =
+    epsilon_s, so the results are numerically identical.  The only potential
+    floating-point discrepancy is in the sparse matvec vs the equivalent dense
+    matmul of a zero-sparse matrix; in IEEE 754 arithmetic these are both exact.
+
+    Returns
+    -------
+    delta_z_list : list[tf.Tensor] — same shapes as linearized_activity_diffs.
+    y_noisy_approx : tf.Tensor
+    cost_stats : dict — keys match SAL_COST_KEYS; all counts are analytical,
+                        not measured wall-clock time.
+    """
+    n_layers = len(model.layers_list)
+    batch_size = int(tf.shape(model.layers_list[0].inputs_clean)[0].numpy())
+
+    # --- Analytical MAC count for the dense linearized baseline ---
+    # Layer 0 is already free in dense mode (delta_a_prev=None shortcut), so
+    # dense MACs start from layer 1.
+    dense_macs = sum(
+        batch_size * model.layers_list[l - 1].units * model.layers_list[l].units
+        for l in range(1, n_layers)
+    )
+
+    # --- Find first perturbed layer (injection point s) ---
+    first_active = None
+    for i, layer in enumerate(model.layers_list):
+        if float(tf.reduce_sum(tf.abs(layer.noise)).numpy()) > 0.0:
+            first_active = i
+            break
+
+    if first_active is None:
+        # No perturbation at all — all deltas zero, zero MACs.
+        delta_z_list = [
+            tf.zeros([batch_size, layer.units], dtype=tf.float32)
+            for layer in model.layers_list
+        ]
+        last = model.layers_list[-1]
+        y_noisy_approx = last.activation_fn(last.outputs_clean)
+        cost_stats = {
+            "sal_dense_macs":               dense_macs,
+            "sal_sparse_aware_macs":        0,
+            "sal_mac_saving_ratio":         1.0,
+            "sal_selected_layer":           -1,
+            "sal_skipped_prefix_layers":    n_layers,
+            "sal_active_nodes_selected":    0,
+            "sal_active_node_ratio_selected": 0.0,
+            "sal_dense_matmuls":            n_layers - 1,
+            "sal_sparse_matvecs":           0,
+        }
+        return delta_z_list, y_noisy_approx, cost_stats
+
+    s = first_active
+    delta_z_list: list = [None] * n_layers
+    sparse_aware_macs = 0
+    dense_matmuls_executed = 0
+    sparse_matvecs_executed = 0
+
+    # Prefix layers: zero delta_z (no computation).
+    for i in range(s):
+        delta_z_list[i] = tf.zeros(
+            [batch_size, model.layers_list[i].units],
+            dtype=model.layers_list[i].noise.dtype,
+        )
+
+    # Injection layer s: delta_z_s = epsilon_s (no matmul; delta_a_prev = 0).
+    layer_s = model.layers_list[s]
+    delta_z_s = layer_s.noise
+    delta_z_list[s] = delta_z_s
+
+    # Number of active nodes in injection layer (for sparse first-propagation).
+    mask_s = layer_s.noise_mask  # [1, H_s] or None
+    if mask_s is not None:
+        k_s = int(tf.reduce_sum(tf.cast(mask_s > 0, tf.int32)).numpy())
+    else:
+        k_s = layer_s.units
+
+    if s < n_layers - 1:
+        # delta_a_s is sparse: non-zero only at the k_s active positions.
+        z_s = layer_s.outputs_clean
+        fprime_s = _activation_derivative_elementwise(layer_s.activation_fn, z_s)
+        delta_a_s = fprime_s * delta_z_s  # [batch, H_s]
+
+        # First propagation after injection: sparse matvec if k_s < H_s.
+        layer_next = model.layers_list[s + 1]
+        epsilon_next = layer_next.noise
+
+        if mask_s is not None and k_s < layer_s.units:
+            active_idx = tf.cast(
+                tf.squeeze(tf.where(tf.squeeze(mask_s, axis=0) > 0), axis=1), tf.int32
+            )
+            delta_a_s_cols = tf.gather(delta_a_s, active_idx, axis=1)      # [B, k_s]
+            W_next_rows = tf.gather(layer_next.kernel, active_idx, axis=0)  # [k_s, H_{s+1}]
+            delta_z_next = tf.matmul(delta_a_s_cols, W_next_rows) + epsilon_next
+            sparse_aware_macs += batch_size * k_s * layer_next.units
+            sparse_matvecs_executed += 1
+        else:
+            # k_s == H_s: no column saving, fall back to dense.
+            delta_z_next = tf.matmul(delta_a_s, layer_next.kernel) + epsilon_next
+            sparse_aware_macs += batch_size * layer_s.units * layer_next.units
+            dense_matmuls_executed += 1
+
+        delta_z_list[s + 1] = delta_z_next
+
+        # Remaining layers s+2..L-1: dense propagation (delta is no longer sparse).
+        if s + 1 < n_layers - 1:
+            z_next = layer_next.outputs_clean
+            fprime_next = _activation_derivative_elementwise(
+                layer_next.activation_fn, z_next
+            )
+            delta_a_prev = fprime_next * delta_z_next
+        else:
+            delta_a_prev = None
+
+        for i in range(s + 2, n_layers):
+            layer = model.layers_list[i]
+            delta_z_l = tf.matmul(delta_a_prev, layer.kernel) + layer.noise
+            delta_z_list[i] = delta_z_l
+            sparse_aware_macs += batch_size * model.layers_list[i - 1].units * layer.units
+            dense_matmuls_executed += 1
+            if i < n_layers - 1:
+                z_l = layer.outputs_clean
+                fprime_l = _activation_derivative_elementwise(layer.activation_fn, z_l)
+                delta_a_prev = fprime_l * delta_z_l
+
+    last = model.layers_list[-1]
+    y_noisy_approx = last.activation_fn(last.outputs_clean + delta_z_list[-1])
+
+    mac_saving = (
+        (dense_macs - sparse_aware_macs) / dense_macs if dense_macs > 0 else 0.0
+    )
+    cost_stats = {
+        "sal_dense_macs":               dense_macs,
+        "sal_sparse_aware_macs":        sparse_aware_macs,
+        "sal_mac_saving_ratio":         mac_saving,
+        "sal_selected_layer":           s,
+        "sal_skipped_prefix_layers":    s,  # layers before s have zero matmul cost
+        "sal_active_nodes_selected":    k_s,
+        "sal_active_node_ratio_selected": k_s / layer_s.units,
+        "sal_dense_matmuls":            dense_matmuls_executed,
+        "sal_sparse_matvecs":           sparse_matvecs_executed,
+    }
+    return delta_z_list, y_noisy_approx, cost_stats
+
+
 def _compute_compare_diagnostics(
     model,
     delta_z_list: list,
@@ -404,6 +578,7 @@ def perturbation_gradients(
     grad_dist = None
     coverage_stats = None
     compare_diag = None
+    sal_cost = None
     use_sparse = sparse and variant in {"np", "anp"}
 
     # Precompute fair-budget fraction for probe mode.
@@ -581,6 +756,39 @@ def perturbation_gradients(
                         norm_eps=norm_eps,
                     )
 
+                elif delta_mode == "linearized_sparse_aware":
+                    # ── sparse-aware linearized propagation: prefix skip + sparse matvec ──
+                    # Identical update to delta_mode=linearized for the same mask; the
+                    # difference is only in which matmuls are actually executed.
+                    delta_z_list, y_noisy_approx, _sal = linearized_activity_diffs_sparse_aware(model)
+                    for layer, dz in zip(model.layers_list, delta_z_list):
+                        layer.outputs_noisy = layer.outputs_clean + dz
+                    loss_noisy_lin = loss_fn(y_noisy_approx, y)
+                    performance_diff = tf.reshape(loss_clean - loss_noisy_lin, [-1, 1])
+
+                    if it == num_noise_iters - 1:
+                        sal_cost = _sal
+
+                    if variant == "np":
+                        performance_diff = performance_diff / tf.cast(noise_std**2, performance_diff.dtype)
+
+                    norm_sq_override_val = None
+                    if norm_mode == "ema" and variant == "anp":
+                        norm_sq_override_val = _update_ema_norm(
+                            model, masks, norm_state, step, norm_beta, norm_update_every
+                        )
+
+                    grads = _np_like_grads_from_cached_pass(
+                        model=model,
+                        performance_diff=performance_diff,
+                        variant=variant,
+                        layer_idx=probe_layer,
+                        masks=masks,
+                        norm_mode=norm_mode,
+                        norm_sq_override=norm_sq_override_val,
+                        norm_eps=norm_eps,
+                    )
+
                 elif delta_mode == "compare":
                     # ── compare mode: train on full noisy path; linearized is diagnostic ──
                     y_noisy = model.forward_noisy(x, decorrelate=decorrelated, noise_layer_idx=None)
@@ -714,7 +922,7 @@ def perturbation_gradients(
         tf.reduce_mean(tf.stack([glist[i] for glist in all_iter_grads], axis=0), axis=0)
         for i in range(len(all_iter_grads[0]))
     ]
-    return mean_grads, y_clean, loss_clean, sparse_info, grad_dist, coverage_stats, compare_diag
+    return mean_grads, y_clean, loss_clean, sparse_info, grad_dist, coverage_stats, compare_diag, sal_cost
 
 
 def optimizer_from_name(name: str, lr: float):
@@ -780,6 +988,7 @@ def train_step(
                 "delta_mode != 'noisy' is only supported with noise_sampling='single'"
             )
 
+    sal_cost = None
     if algorithm == "bp":
         grads, y_pred, loss_per_sample = bp_gradients(
             model=model,
@@ -789,7 +998,7 @@ def train_step(
             decorrelated=decorrelated,
         )
     elif algorithm in {"np", "anp", "inp"}:
-        grads, y_pred, loss_per_sample, sparse_info, grad_dist, coverage_stats, compare_diag = \
+        grads, y_pred, loss_per_sample, sparse_info, grad_dist, coverage_stats, compare_diag, sal_cost = \
             perturbation_gradients(
                 model=model,
                 x=x,
@@ -833,4 +1042,4 @@ def train_step(
 
     optimizer.apply_gradients(zip(grads, model.ordered_trainable_variables()))
     return (y_pred, loss_per_sample, sparse_info, grad_dist, coverage_stats, compare_diag,
-            decor_update_performed)
+            decor_update_performed, sal_cost)

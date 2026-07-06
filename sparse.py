@@ -164,14 +164,30 @@ def compute_sparse_masks(
         per-layer fractions (one per entry in ``model.layers_list``).
         Per-layer fractions are produced by :func:`allocate_fractions`.
     policy : str
-        One of ``"random"``, ``"scheduled"``, ``"activation_threshold"``.
+        One of ``"random"``, ``"scheduled"``, ``"activation_threshold"``,
+        ``"scheduled_layer"``.
     step : int
-        Global training step, used by the ``"scheduled"`` policy.
+        Global training step, used by the ``"scheduled"`` and
+        ``"scheduled_layer"`` policies.
+
+    ``scheduled_layer``: one layer is selected per step in a round-robin,
+    with only ``fraction`` of that layer's nodes perturbed using the existing
+    scheduled (round-robin) mask.  All other layers receive an all-zero mask.
+    This concentrates each step's perturbation on a single layer, enabling
+    prefix skipping in ``delta_mode=linearized_sparse_aware``.
 
     Requires a clean forward pass to have been run already (``layer.outputs_clean``
     must be populated) for the ``"activation_threshold"`` policy.
     """
+    n_layers = len(model.layers_list)
     masks = []
+
+    # Pre-compute scheduled_layer selection once, outside the per-layer loop.
+    if policy == "scheduled_layer":
+        selected = step % n_layers
+        # layer_step = number of times this layer has been the selected one.
+        layer_step = step // n_layers
+
     for i, layer in enumerate(model.layers_list):
         f = fraction[i] if isinstance(fraction, list) else fraction
         units = layer.units
@@ -186,6 +202,11 @@ def compute_sparse_masks(
                     "Need a clean forward pass before computing activation_threshold masks."
                 )
             mask = activation_threshold_mask(layer.outputs_clean, f)
+        elif policy == "scheduled_layer":
+            if i == selected:
+                mask = scheduled_mask(units, f, step=layer_step)
+            else:
+                mask = tf.zeros([1, units], dtype=tf.float32)
         else:
             raise ValueError(f"Unknown sparse policy: {policy}")
 

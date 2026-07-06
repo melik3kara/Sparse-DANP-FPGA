@@ -18,7 +18,7 @@ from utils import (
     set_seed,
 )
 from models import MLP
-from algorithms import optimizer_from_name, train_step, COMPARE_DIAG_KEYS
+from algorithms import optimizer_from_name, train_step, COMPARE_DIAG_KEYS, SAL_COST_KEYS
 from analysis import GD_STAT_KEYS, empty_grad_dist_history, save_gradient_dist_results
 from sparse import allocate_fractions
 from coverage import (
@@ -65,7 +65,7 @@ def parse_args():
     )
     parser.add_argument(
         "--sparse_policy", type=str, default="random",
-        choices=["random", "scheduled", "activation_threshold",
+        choices=["random", "scheduled", "scheduled_layer", "activation_threshold",
                  "activity_diff_topk", "activity_loss_topk", "gradient_aligned_topk"],
         help="Policy for selecting active nodes when --sparse is set.",
     )
@@ -156,7 +156,7 @@ def parse_args():
     # --- linearized ANP ---
     parser.add_argument(
         "--delta_mode", type=str, default="noisy",
-        choices=["noisy", "linearized", "compare"],
+        choices=["noisy", "linearized", "linearized_sparse_aware", "compare"],
         help=(
             "How to compute per-layer activity differences δz_l used in the ANP update. "
             "'noisy' (default): full nonlinear noisy forward pass — current behaviour. "
@@ -280,6 +280,7 @@ def run_single_seed(
     norm_state: dict = {"ema_norm": None}  # EMA of ‖δa‖² for norm_mode="ema"
     decor_updates_performed = 0
     total_train_steps = 0
+    epoch_sal: dict | None = None  # set per epoch; last value used as sal_final
 
     for epoch in range(args.epochs):
         train_loss_m  = tf.keras.metrics.Mean()
@@ -293,11 +294,13 @@ def run_single_seed(
                         if args.analyze_gradient_dist else None
         cd_metrics    = {k: tf.keras.metrics.Mean() for k in COMPARE_DIAG_KEYS} \
                         if args.delta_mode == "compare" else None
+        sal_metrics   = {k: tf.keras.metrics.Mean() for k in SAL_COST_KEYS} \
+                        if args.delta_mode == "linearized_sparse_aware" else None
         batch_cov_list: list[list[dict]] = []
 
         for x, y in train_ds:
             y_pred, loss_per_sample, sparse_info, grad_dist, coverage_stats, compare_diag, \
-                decor_update_performed = train_step(
+                decor_update_performed, sal_cost = train_step(
                 model=model,
                 optimizer=optimizer,
                 x=x,
@@ -356,6 +359,12 @@ def run_single_seed(
                     v = compare_diag.get(k, float("nan"))
                     if v == v:
                         cd_metrics[k].update_state(v)
+
+            if sal_metrics is not None and sal_cost is not None:
+                for k in SAL_COST_KEYS:
+                    v = sal_cost.get(k, float("nan"))
+                    if v == v:
+                        sal_metrics[k].update_state(v)
 
             if coverage_stats is not None:
                 batch_cov_list.append(coverage_stats)
@@ -444,6 +453,20 @@ def run_single_seed(
         else:
             epoch_cd = None
 
+        if sal_metrics is not None:
+            epoch_sal = {
+                k: float(sal_metrics[k].result().numpy())
+                   if sal_metrics[k].count.numpy() > 0 else float("nan")
+                for k in SAL_COST_KEYS
+            }
+            ratio = epoch_sal.get("sal_mac_saving_ratio", float("nan"))
+            sel   = epoch_sal.get("sal_selected_layer", float("nan"))
+            skip  = epoch_sal.get("sal_skipped_prefix_layers", float("nan"))
+            print(f"  sal: mac_saving={ratio:.3f}  selected_layer={sel:.1f}  "
+                  f"skipped_prefix={skip:.1f}")
+        else:
+            epoch_sal = None
+
     runtime_s = time.time() - t0
     ema_norm_final = norm_state.get("ema_norm")  # None when norm_mode != "ema"
 
@@ -457,7 +480,7 @@ def run_single_seed(
             "linearized_delta_path_used":            1,
             "nonlinear_noisy_activation_evals_saved": 0,
         }
-    elif args.delta_mode == "linearized":
+    elif args.delta_mode in {"linearized", "linearized_sparse_aware"}:
         hidden_units = sum(l.units for l in model.layers_list[:-1])
         compare_final = {
             **{k: float("nan") for k in COMPARE_DIAG_KEYS},
@@ -465,6 +488,9 @@ def run_single_seed(
             "linearized_delta_path_used":            1,
             "nonlinear_noisy_activation_evals_saved": args.batch_size * hidden_units,
         }
+
+    # SAL cost summary (last epoch mean per batch, or None)
+    sal_final: dict | None = epoch_sal  # already None when delta_mode != linearized_sparse_aware
 
     decor_update_fraction = (
         decor_updates_performed / total_train_steps if total_train_steps > 0 else float("nan")
@@ -479,7 +505,7 @@ def run_single_seed(
     print(f"\nFinished seed {seed} in {runtime_s:.1f}s | "
           f"final test acc {history['test_acc'][-1]:.4f} | "
           f"best test acc {max(a for a in history['test_acc'] if a == a):.4f}")
-    return history, grad_dist_history, cov_history, runtime_s, ema_norm_final, compare_final, decor_stats
+    return history, grad_dist_history, cov_history, runtime_s, ema_norm_final, compare_final, decor_stats, sal_final
 
 
 def save_run_summary_csv(
@@ -527,6 +553,7 @@ def save_run_summary_csv(
         "nonlinear_noisy_activation_evals_saved":
             config.get("nonlinear_noisy_activation_evals_saved", 0),
         **{f"compare_{k}": config.get(k, float("nan")) for k in COMPARE_DIAG_KEYS},
+        **{k: config.get(k, float("nan")) for k in SAL_COST_KEYS},
         "lr":                  config.get("lr", float("nan")),
         "epochs":              config.get("epochs", ""),
         "seed":                seed,
@@ -604,7 +631,7 @@ def run_probe_all(args) -> None:
 
         for seed_offset in range(args.num_seeds):
             seed = args.seed + seed_offset
-            history, grad_dist_history, cov_history, runtime_s, _ema, _cmp, _decor = run_single_seed(
+            history, grad_dist_history, cov_history, runtime_s, _ema, _cmp, _decor, _sal = run_single_seed(
                 args, seed, probe_layer=l_idx,
             )
             for key in all_histories:
@@ -676,7 +703,7 @@ def main():
 
     for seed_offset in range(args.num_seeds):
         seed = args.seed + seed_offset
-        history, grad_dist_history, cov_history, runtime_s, ema_norm_final, compare_final, decor_stats = \
+        history, grad_dist_history, cov_history, runtime_s, ema_norm_final, compare_final, decor_stats, sal_final = \
             run_single_seed(args, seed)
 
         for key in all_histories:
@@ -696,6 +723,8 @@ def main():
             csv_config.update(compare_final)
         if decor_stats is not None:
             csv_config.update(decor_stats)
+        if sal_final is not None:
+            csv_config.update(sal_final)
         save_run_summary_csv(result_dir, seed=seed, history=history,
                              config=csv_config, runtime_s=runtime_s)
 
