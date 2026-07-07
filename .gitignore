@@ -1,0 +1,83 @@
+# ------------------------------------------------------------
+# Python caches
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------
+# Virtual environments
+# ------------------------------------------------------------
+.venv/
+.venv-*/
+venv/
+env/
+
+# ------------------------------------------------------------
+# Editor and OS files
+# ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------
+# C / C++ build artifacts
+# ------------------------------------------------------------
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# Phase-1 compiled executable
+fpga/phase1_cpp/test_phase1
+
+# ------------------------------------------------------------
+# Generated Phase-0 golden fixtures
+# (manifest.json, golden.npz, bin/*.bin, and any logs inside them).
+# The exporter source fpga/phase0_export_golden.py stays tracked.
+# ------------------------------------------------------------
+fpga/phase0/golden_*/
+
+# ------------------------------------------------------------
+# Vitis HLS / Vivado generated artifacts
+# Keep source code, testbenches, headers, Tcl scripts and reports
+# that are intentionally written by us.
+# ------------------------------------------------------------
+fpga/**/build/
+fpga/**/logs/
+fpga/**/.Xil/
+fpga/**/.autopilot/
+fpga/**/solution*/
+fpga/**/csim/
+fpga/**/syn/
+fpga/**/sim/
+fpga/**/impl/
+
+*.jou
+*.str
+*.wdb
+*.vcd
+*.xclbin
+*.bit
+*.ltx
+*.xsa
+
+# ------------------------------------------------------------
+# Runtime logs
+# ------------------------------------------------------------
+*.log
+
+# ------------------------------------------------------------
+# Local Claude state/configuration
+# ------------------------------------------------------------
+.claude/
