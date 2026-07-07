@@ -65,4 +65,15 @@ void anp_linearized_delta(
     float dz0[8], float dz1[4], float dz2[2],
     float clean_logits[2], float approx_logits[2]);
 
+// C. Exact-original ANP with reused first layer: identical semantics/outputs to A,
+//    but noisy layer-0 uses zn0 = zc0 + eps0 instead of recomputing x @ W0 + b0.
+//    Later noisy layers stay full nonlinear. Same output interface as kernel A.
+void anp_original_reuse_l0(
+    const float x[16],
+    const float W0[16 * 8], const float b0[8], const float eps0[8],
+    const float W1[8 * 4],  const float b1[4], const float eps1[4],
+    const float W2[4 * 2],  const float b2[2], const float eps2[2],
+    float dz0[8], float dz1[4], float dz2[2],
+    float clean_logits[2], float noisy_logits[2]);
+
 #endif // ANP_HLS_HPP

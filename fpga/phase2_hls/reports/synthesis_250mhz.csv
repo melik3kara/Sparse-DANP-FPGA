@@ -1,0 +1,17 @@
+# Phase-2 HLS synthesis-only characterization @ 250 MHz (4 ns) -- Vitis HLS 2025.1, part xck26-sfvc784-2LV-c.
+# Same source / interfaces / directives as the 100 MHz run; only the clock constraint differs. Synth only (no cosim).
+#
+# TIMING FIELDS (corrected audit): from the csynth "Timing" table (Target/Estimated/Uncertainty) and HLS 200-789.
+#   hls_scheduling_slack_ns = target_clock_ns - clock_uncertainty_ns - hls_estimated_clock_ns (4.00 - 1.08 - 2.913 = 0.01).
+#   post_impl_achieved_period is NOT AVAILABLE: no Vivado place-and-route / board timing was run.
+#   Do NOT read (target - slack) as an achieved period. hls_estimated_clock_ns is a pre-implementation estimate only.
+#
+# Both kernels met the HLS timing estimate (positive slack). Latency in CYCLES rises vs 100 MHz (deeper pipelining
+# to close 4 ns) but latency in ns falls (faster clock). FP operator core count is UNCHANGED vs 100 MHz (met via
+# added pipeline registers, NOT by replicating floating-point units). All numbers are HLS estimates, not board measurements.
+#
+# NOTE: the exact-reuse kernel B (anp_original_reuse_l0) was intentionally NOT characterized at 250 MHz -- the reuse
+# audit only required the 100 MHz decomposition. It can be added later with tcl/run_original_reuse.tcl @ 4 ns.
+kernel,label,top_function,part,target_clock_ns,clock_uncertainty_ns,hls_estimated_clock_ns,hls_scheduling_slack_ns,hls_estimated_fmax_mhz,post_impl_achieved_period_ns,synth_status,csynth_latency_min_cycles,csynth_latency_max_cycles,csynth_ii_cycles,csynth_latency_ns,LUT,FF,DSP,BRAM,URAM,fp_operator_cores
+A,direct_original,anp_original_forward,xck26-sfvc784-2LV-c,4.00,1.08,2.913,0.01,343.29,not_available,PASS,844,844,845,3376,10296,14390,15,0,0,4 (2 fmul + 1 fadd + 1 faddfsub)
+C,dense_linearized,anp_linearized_delta,xck26-sfvc784-2LV-c,4.00,1.08,2.913,0.01,343.29,not_available,PASS,611,611,612,2444,7927,10959,13,0,0,4 (2 fmul + 2 fadd)
