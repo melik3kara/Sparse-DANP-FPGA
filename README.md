@@ -24,8 +24,6 @@ training cost components for FPGA-oriented online learning systems?
    - [E11 Linearized ANP: replacing the nonlinear noisy forward](#e11)
    - [E12 Lazy DANP decorrelation: amortizing R updates](#e12)
 5. [Key findings](#findings)
-6. [Limitations and next steps](#limitations)
-7. [Missing / unverified data](#missing)
 
 ---
 
@@ -958,65 +956,3 @@ reduction. Applying R and the main ANP/DANP weight updates still occur every ste
    preserved performance within seed-level variation while reducing R updates to
    20%, but K≥20 degraded accuracy.
 
----
-
-## 6. Limitations and next steps <a name="limitations"></a>
-
-**Limitations:**
-
-- **n=3 seeds** throughout. Differences smaller than ≈2× the reported std should be
-  treated as trends, not established results. No significance tests are reported.
-- **MNIST saturates.** Above α ≈ 0.06 (9 nodes), MNIST accuracy changes by < 0.004
-  — the budget sweep is more informative on Fashion-MNIST.
-- **Plain ANP on CIFAR-10 collapses.** All CIFAR-10 experiments require DANP. An
-  earlier dense pilot of plain ANP (smaller MLP) reached chance-level accuracy (~0.10);
-  DANP's decorrelation step is required for CIFAR-10.
-- **No FPGA resource measurement.** All cost figures are relative node counts (α).
-  Actual energy, LUT utilisation, and throughput on target hardware have not been
-  measured.
-- **Gradient distribution stats from earlier logs.** The CV/Gini/Top-10% values (E3)
-  are from a pre-CSV logging format; no per-seed breakdown is available.
-- **EMA normalizer results are limited.** Based on n=3 seeds and Fashion-MNIST only.
-  The K effect is non-monotonic: K=20 was unstable at α=0.0625, so further seeds and
-  datasets are needed before claiming robustness across configurations.
-- **Linearized ANP is a pilot.** Results are based on Fashion-MNIST, n=3 seeds, ANP
-  [64,64], and σ=0.01 only. Compare-mode diagnostics confirm the first-order
-  approximation is close at this scale (rel_δz < 0.30%, rel_δlogits < 0.84%), but
-  validation on CIFAR-10, DANP, or wider networks has not been done. The current
-  implementation does not yet implement sparse delta-matmul skipping or measure FPGA
-  runtime/resource savings.
-- **Lazy DANP decorrelation is a pilot.** Tested only on CIFAR-10, DANP
-  [256,256,256], 5 epochs, n=3 seeds. FPGA runtime/resource savings are not yet
-  measured.
-
-**Next steps:**
-
-1. **FPGA cost model on Kria.** Translate active-node cost, RNG cost, noisy-pass count,
-   and normalization overhead into FPGA-relevant proxy metrics. Then measure throughput
-   and resource usage on KR260 where feasible.
-2. **Reduce computation inside the algorithm.** EMA normalization (E10) is a first step
-   toward amortizing the ‖δa‖² reduction. Further candidates: validate lazy
-   decorrelation on larger DANP models, explore block-diagonal / low-rank
-   decorrelation, and quantise the weight update.
-3. **Confirm resample trend** with more seeds (n ≥ 5) before committing to it.
-4. **Harder benchmarks** (CIFAR-100, or an edge-vision task) once the FPGA pipeline is
-   in place.
-5. **Extend linearized ANP to harder datasets and wider networks.** Compare-mode
-   diagnostics on Fashion-MNIST confirm the small-noise approximation holds at σ=0.01
-   for ANP [64,64]. Validation on CIFAR-10 / DANP and larger networks remains open.
-6. **Explore sparse delta propagation / skipped delta matmuls** so that linearized ANP
-   can turn sparse perturbation into actual matmul reduction.
-
----
-
-## 7. Missing / unverified data <a name="missing"></a>
-
-| Item | Status |
-|---|---|
-| Per-seed accuracy for all DANP h=1024 experiments | No `run_summary.csv`; only `peak_test_acc.txt` (peak across 3 seeds) |
-| Per-epoch CV, Gini, Top-10% for gradient distribution | Pre-CSV format; means from progress report logs |
-| MNIST random 50% at 20 epochs, DANP h=1024 | Experiment not run at 20 epochs |
-| MNIST scheduled 50% at 20 epochs, DANP h=1024 | Experiment not run |
-| ANP [64,64] CIFAR-10 with sparse perturbation | Not run; only dense pilot exists |
-| `noise_std` and `noise_distribution` for layer_allocation and probe_layer | Not in CSV (pre-feature addition); inferred as `gaussian` / `0.01` from code defaults |
-| Fashion-MNIST linearized compare-mode diagnostics | Completed: α ∈ {0.0625, 0.125, 0.25}, n=3 seeds; results in E11 compare-mode section |
