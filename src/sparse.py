@@ -28,7 +28,7 @@ activity_loss_topk   Top-k by mean |Δactivation × Δloss|.  Scores the ANP
                      numerator directly, so rank reflects loss-correlated
                      response.
 
-gradient_aligned_topk
+update_magnitude_topk
                      Top-k by mean |Δactivation × Δloss / ‖Δact‖²|.  Scores
                      the full per-node ANP effective-error magnitude g_i,
                      accounting for the network-level normalisation.  The most
@@ -451,10 +451,10 @@ def compute_activity_loss_score_stats(
 
 
 # ---------------------------------------------------------------------------
-# gradient_aligned_topk policy
+# update_magnitude_topk policy
 # ---------------------------------------------------------------------------
 
-def gradient_aligned_topk_mask(
+def update_magnitude_topk_mask(
     activity_diff: tf.Tensor,     # [batch, units]
     performance_diff: tf.Tensor,  # [batch, 1]
     network_norm_sq: tf.Tensor,   # [batch, 1]
@@ -493,7 +493,7 @@ def gradient_aligned_topk_mask(
     return tf.reshape(mask, [1, units])
 
 
-def compute_gradient_aligned_topk_masks(
+def compute_update_magnitude_topk_masks(
     model,
     performance_diff: tf.Tensor,  # [batch, 1]
     network_norm_sq: tf.Tensor,   # [batch, 1]
@@ -513,18 +513,18 @@ def compute_gradient_aligned_topk_masks(
         if layer.outputs_clean is None or layer.outputs_noisy is None:
             raise RuntimeError(
                 "Need a clean AND a provisional noisy forward pass before "
-                "computing gradient_aligned_topk masks."
+                "computing update_magnitude_topk masks."
             )
         activity_diff = layer.outputs_noisy - layer.outputs_clean
         masks.append(
-            gradient_aligned_topk_mask(
+            update_magnitude_topk_mask(
                 activity_diff, performance_diff, network_norm_sq, fraction
             )
         )
     return masks
 
 
-def compute_gradient_aligned_score_stats(
+def compute_update_magnitude_score_stats(
     model,
     masks: list[tf.Tensor],
     performance_diff: tf.Tensor,  # [batch, 1]
@@ -532,7 +532,7 @@ def compute_gradient_aligned_score_stats(
 ) -> dict:
     """Mean |activity_diff * performance_diff / network_norm_sq| for selected vs unselected nodes.
 
-    Call after compute_gradient_aligned_topk_masks and BEFORE the provisional
+    Call after compute_update_magnitude_topk_masks and BEFORE the provisional
     noise is zeroed (layer.outputs_noisy still holds the full-noise activations).
     """
     selected_scores = []

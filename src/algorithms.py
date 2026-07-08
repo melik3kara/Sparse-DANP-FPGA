@@ -8,8 +8,8 @@ from sparse import (
     compute_activity_diff_score_stats,
     compute_activity_loss_topk_masks,
     compute_activity_loss_score_stats,
-    compute_gradient_aligned_topk_masks,
-    compute_gradient_aligned_score_stats,
+    compute_update_magnitude_topk_masks,
+    compute_update_magnitude_score_stats,
     mask_stats,
     build_probe_masks,
 )
@@ -647,17 +647,17 @@ def perturbation_gradients(
                     layer.noise = layer.noise * tf.cast(mask, layer.noise.dtype)
                     layer.noise_mask = mask
 
-            elif sparse_policy == "gradient_aligned_topk":
+            elif sparse_policy == "update_magnitude_topk":
                 # Two-pass: provisional forward → top-k by mean|Δact × Δloss / ‖Δact‖²|
                 model.reset_all_noise(noise_std, masks=None, noise_distribution=noise_distribution)
                 y_noisy_prov = model.forward_noisy(x, decorrelate=decorrelated, noise_layer_idx=None)
                 loss_noisy_prov = loss_fn(y_noisy_prov, y)
                 performance_diff_prov = tf.reshape(loss_clean - loss_noisy_prov, [-1, 1])
                 network_norm_sq_prov, _ = _network_activity_stats(model, masks=None)
-                masks = compute_gradient_aligned_topk_masks(
+                masks = compute_update_magnitude_topk_masks(
                     model, performance_diff_prov, network_norm_sq_prov, fraction=sparse_fraction
                 )
-                score_stats = compute_gradient_aligned_score_stats(
+                score_stats = compute_update_magnitude_score_stats(
                     model, masks, performance_diff_prov, network_norm_sq_prov
                 )
                 for layer, mask in zip(model.layers_list, masks):

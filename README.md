@@ -86,58 +86,32 @@ Two mask policies:
 
 ```
 .
-├── main.py              # entry point; all experiments run through this
-├── algorithms.py        # perturbation_gradients(), train_step()
-├── models.py            # MLP, DecorrelatedDense (reset_noise, forward_noisy)
-├── sparse.py            # allocate_fractions(), compute_sparse_masks()
-├── coverage.py          # per-layer coverage stats (mask / effective / norms)
-├── analysis.py          # gradient distribution stats (CV, Gini, Top-10%)
-├── utils.py             # dataset loaders, evaluation, I/O helpers
-├── sweep_budget.py      # grid sweep helper (fractions × policies × algorithms)
-├── sweep_lr.py          # learning-rate grid helper
-├── plot.py / plot_sweep.py  # plotting utilities
-└── results/
-    ├── dense_anp_baseline/          # ANP [64,64] Gaussian dense, MNIST
-    ├── dense_rademacher_baseline/   # ANP [64,64] Rademacher dense, MNIST
-    ├── budget_sweep_anp/            # ANP [64,64] Gaussian random+scheduled sweep, MNIST
-    ├── rademacher_budget_sweep/     # ANP [64,64] Rademacher scheduled sweep, MNIST
-    ├── layer_allocation/            # ANP [64,64] uniform/front/back/middle, MNIST
-    ├── probe_layer/                 # ANP [64,64] single-layer probe, MNIST
-    ├── fashion_dense/               # ANP [64,64] Gaussian+Rademacher dense, Fashion-MNIST
-    ├── fashion_rademacher_budget/   # ANP [64,64] Rademacher scheduled, Fashion (α≥0.0625)
-    ├── fashion_rademacher_budget_extreme/  # same, α=0.015625 and 0.03125
-    ├── fashion_rademacher_random_policy/   # ANP [64,64] Rademacher random, Fashion
-    ├── fashion_antithetic_anp/      # ANP [64,64] single/antithetic/resample, Fashion
-    ├── fashion_norm_ablation/       # ANP [64,64] exact/ema norm, Fashion (E10)
-    ├── cifar10_dense_pilot/         # ANP [64,64] Gaussian+Rademacher dense, CIFAR-10
-    ├── mnist_danp_full_20/          # DANP [1024,1024,1024] full, MNIST  †
-    ├── mnist_danp_random_25_20/     # DANP [1024,1024,1024] random 25%, MNIST  †
-    ├── mnist_danp_scheduled_25_20/  # DANP [1024,1024,1024] scheduled 25%, MNIST  †
-    ├── mnist_danp_actloss_25/       # DANP activity-loss topk 25%, MNIST (5ep)  †
-    ├── mnist_danp_sparse_actdiff_25/# DANP activity-diff topk 25%, MNIST (5ep)  †
-    ├── cifar10_danp_full/           # DANP [1024,1024,1024] full, CIFAR-10  †
-    ├── cifar10_danp_scheduled_25/   # DANP scheduled 25%, CIFAR-10  †
-    ├── cifar10_danp_gradalign_25/   # DANP gradient-aligned topk 25%, CIFAR-10  †
-    ├── mnist_danp_full_h64/         # DANP [64,64,64] full, MNIST (width sweep)  †
-    ├── mnist_danp_sched25_h64/      # DANP [64,64,64] scheduled 25%, MNIST  †
-    ├── mnist_danp_full_h256/        # DANP [256,256,256] full, MNIST  †
-    ├── mnist_danp_sched25_h256/     # DANP [256,256,256] scheduled 25%, MNIST  †
-    ├── fashion_linearized_pilot/    # ANP [64,64] noisy vs linearized, Fashion-MNIST (E11)
-    ├── fashion_linearized_compare/  # ANP [64,64] compare-mode diagnostics, Fashion-MNIST (E11)
-    ├── cifar10_lazy_danp_pilot/     # DANP [256,256,256] lazy decorrelation, CIFAR-10 (E12)
-    └── ...
+├── README.md
+├── main.py                      # entry point; all experiments run through this
+├── src/
+│   ├── algorithms.py        # perturbation_gradients(), train_step()
+│   ├── models.py            # MLP, DecorrelatedDense
+│   ├── sparse.py            # allocate_fractions(), compute_sparse_masks()
+│   ├── coverage.py          # per-layer coverage stats
+│   ├── analysis.py          # gradient distribution stats (CV, Gini, Top-10%)
+│   ├── utils.py             # dataset loaders, evaluation, I/O helpers
+│   ├── scripts/
+│   │   ├── sweep_budget.py  # grid sweep: fraction × policy × algorithm × seed
+│   │   └── sweep_lr.py      # LR grid sweep
+│   └── tests/
+│       └── test_sal_equivalence.py  # SAL-ANP losslessness check (36 cases)
+├── reports/
+│   ├── progress_report_v4.pdf
+│   ├── progress_report_v5.pdf
+│   └── PROGRESS.md
+└── results/                     # experiment outputs (not tracked in git)
 ```
 
-† Directories marked with † predate the `run_summary.csv` format. Numbers from these
-are taken from `peak_test_acc.txt` (peak over all seeds and epochs; no per-seed
-breakdown). All other experiments have `run_summary.csv` with one row per seed.
-
 Each `results/<exp>/` directory contains:
-- `run_summary.csv` — one row per seed (where available); columns include
-  `algorithm`, `hidden_sizes`, `sparse_fraction`, `sparse_policy`,
-  `noise_distribution`, `noise_sampling`, `noisy_passes`, `best_test_acc`,
-  `rel_cost_final`.
-- `peak_test_acc.txt` — max test accuracy across seeds and epochs (all experiments).
+- `run_summary.csv` — one row per seed; columns include `algorithm`, `hidden_sizes`,
+  `sparse_fraction`, `sparse_policy`, `noise_distribution`, `noise_sampling`,
+  `noisy_passes`, `best_test_acc`, `rel_cost_final`.
+- `peak_test_acc.txt` — max test accuracy across seeds and epochs.
 - `<exp_name>.json` — full argument config saved at run time.
 - Per-metric `_mean.txt`, `_std.txt`, `_traj.txt` trajectory files.
 
@@ -189,7 +163,7 @@ python main.py \
 | `--batch_size` | Minibatch size | 500 (all ANP [64,64] experiments), 1000 (DANP [1024³] experiments — from saved config) |
 | `--sparse` | Enable sparse perturbation | flag (absent = dense) |
 | `--sparse_fraction` | Active fraction α = k/H | 0.0156 – 0.5 |
-| `--sparse_policy` | Node selection policy | `random`, `scheduled`, `activity_loss_topk`, `activity_diff_topk`, `gradient_aligned_topk` |
+| `--sparse_policy` | Node selection policy | `random`, `scheduled`, `activity_loss_topk`, `activity_diff_topk`, `update_magnitude_topk` |
 | `--layer_allocation` | Budget split across layers | `uniform`, `front_loaded`, `back_loaded`, `middle_loaded` |
 | `--noise_distribution` | Noise type | `gaussian`, `rademacher` |
 | `--noise_sampling` | One or two noisy passes | `single`, `antithetic`, `resample` |

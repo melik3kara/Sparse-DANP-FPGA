@@ -1,0 +1,10 @@
+# experiment outputs
+results/
+results.zip
+results_report.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

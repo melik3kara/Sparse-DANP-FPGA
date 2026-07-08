@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
 import csv
 import json
-import os
 import time
 import argparse
 from pathlib import Path
@@ -66,7 +69,7 @@ def parse_args():
     parser.add_argument(
         "--sparse_policy", type=str, default="random",
         choices=["random", "scheduled", "scheduled_layer", "activation_threshold",
-                 "activity_diff_topk", "activity_loss_topk", "gradient_aligned_topk"],
+                 "activity_diff_topk", "activity_loss_topk", "update_magnitude_topk"],
         help="Policy for selecting active nodes when --sparse is set.",
     )
     # --- new: layer allocation ---
